@@ -1,74 +1,12 @@
 <!doctype html>
 <html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>UDP 홀 펀칭</title>
-</head>
-<body>
-  <button id="connect">연결</button>
-  <pre id="log" style="white-space: pre-wrap; word-break: break-all;"></pre>
-
-  <script type="module">
-    import { Punch } from "./punch.js";
-    import { configured, readSignal, writeOffer, writeAnswer, onSignalChange } from "./signaling.js";
-
-    const logEl = document.getElementById("log");
-    function log(msg) {
-      logEl.textContent += `[${new Date().toLocaleTimeString()}] ${msg}\n`;
-      console.log(msg);
-    }
-
-    // offer·answer 컬럼에는 { sid, sdp } JSON을 저장한다.
-    // sid로 어느 offer에 대한 answer인지 구분한다.
-    const parse = (v) => { try { return v ? JSON.parse(v) : null; } catch { return null; } };
-
-    let peer = null;
-    let role = "callee";
-    let sid = null;         // A: 내 offer의 세션 ID / B: 마지막으로 응답한 세션 ID
-    let answered = false;   // A: answer 적용 여부
-
-    async function handleRow(row) {
-      if (!row) return;
-      const offer = parse(row.offer);
-      const answer = parse(row.answer);
-      if (role === "caller") {
-        if (answer?.sid === sid && !answered) {
-          answered = true;
-          log("answer 수신 → 적용");
-          await peer.acceptAnswer(answer.sdp);
-        }
-      } else if (offer && offer.sid !== sid && answer?.sid !== offer.sid) {
-        sid = offer.sid;
-        peer?.close();
-        peer = new Punch(log, false);
-        log("offer 수신 → answer 생성");
-        const sdp = await peer.createAnswer(offer.sdp);
-        await writeAnswer(JSON.stringify({ sid: offer.sid, sdp }));
-        log("answer 쓰기 완료");
-      }
-    }
-
-    const run = (fn) => (...args) => fn(...args).catch((e) => log(`오류: ${e.message}`));
-
-    document.getElementById("connect").onclick = run(async () => {
-      role = "caller";
-      sid = crypto.randomUUID();
-      answered = false;
-      peer?.close();
-      peer = new Punch(log, true);
-      log("offer 생성");
-      const sdp = await peer.createOffer();
-      await writeOffer(JSON.stringify({ sid, sdp }));
-      log("offer 쓰기 완료 → answer 대기");
-    });
-
-    if (!configured) {
-      log("signaling.js에 Supabase URL과 키를 넣어야 합니다.");
-    } else {
-      onSignalChange(run(handleRow), (status) => log(`구독 상태: ${status}`));
-      run(async () => handleRow(await readSignal()))();
-    }
-  </script>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>UDP 홀 펀칭</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
 </html>
