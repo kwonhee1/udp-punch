@@ -1,11 +1,15 @@
 // 로비(접속 기기 목록)와 상대별 연결을 관리한다.
 // - 목록: Supabase Realtime presence
 // - 시그널링: Supabase Realtime broadcast (offer·answer를 상대 id로 보낸다)
+// - 연결: 상대 공인 IP가 내 것과 같으면 LocalConnection, 다르면 PunchConnection
 // React에 의존하지 않는다. subscribe / getSnapshot으로 화면에 상태를 넘긴다.
 
 import { createClient, type RealtimeChannel, type SupabaseClient } from "@supabase/supabase-js";
+import type { Connection, ConnectionEvent, ConnectionOptions } from "./connection";
 import { deviceLabel, newId, randomName } from "./identity";
-import { DEFAULT_ICE_SERVERS, Punch, probePublicIp, type PunchEvent } from "./punch";
+import { LocalConnection } from "./local";
+import { PunchConnection } from "./punch";
+import { DEFAULT_ICE_SERVERS, probePublicIp } from "./rtc";
 
 const LOBBY_TOPIC = "lobby";
 const CONNECT_TIMEOUT_MS = 20000;
@@ -18,12 +22,14 @@ export interface PeerInfo {
   ip: string | null;
 }
 
+/** local: 같은 네트워크 방식 (LocalConnection) / punch: 공인 주소 방식 (PunchConnection) */
+export type ConnectionMode = "local" | "punch";
+
 export type SessionState = "gathering" | "waiting" | "punching" | "connected" | "disconnected" | "failed" | "closed";
 
 export interface SessionView {
   role: "caller" | "callee";
-  /** 같은 네트워크 방식(host 후보 유지)으로 연결 중인지 */
-  local: boolean;
+  mode: ConnectionMode;
   state: SessionState;
   pair?: string | null;
   rtt?: number;
@@ -48,7 +54,7 @@ export interface PeerManagerConfig {
 interface Session {
   sid: string;
   answered: boolean;
-  punch: Punch;
+  conn: Connection;
   view: SessionView;
   timer: ReturnType<typeof setTimeout>;
 }
@@ -59,6 +65,7 @@ type Signal = {
   kind: "offer" | "answer";
   sid: string;
   sdp: string;
+  /** offer에만 붙는다. true면 받는 쪽도 LocalConnection을 쓴다 (2단계 신호 형식과 호환) */
   local?: boolean;
 };
 
@@ -170,7 +177,7 @@ export class PeerManager {
   }
 
   ping(peerId: string): void {
-    this.sessions.get(peerId)?.punch.ping();
+    this.sessions.get(peerId)?.conn.ping();
   }
 
   isSameNetwork(peer: PeerInfo): boolean {
@@ -181,16 +188,16 @@ export class PeerManager {
 
   private async connectTo(peerId: string): Promise<void> {
     const peer = this.peers.get(peerId);
-    // 상대 공인 IP가 내 공인 IP와 같으면 같은 네트워크 방식(host 후보 유지)으로 연결한다
-    const local = peer ? this.isSameNetwork(peer) : false;
+    // 연결 방식은 거는 쪽만 정한다: 상대 공인 IP가 내 공인 IP와 같으면 같은 네트워크 방식
+    const mode: ConnectionMode = peer && this.isSameNetwork(peer) ? "local" : "punch";
     this.endSession(peerId);
-    const s = this.newSession(peerId, "caller", local);
+    const s = this.newSession(peerId, "caller", mode);
     this.update(peerId, "gathering");
     try {
-      const sdp = await s.punch.createOffer(local);
+      const sdp = await s.conn.createOffer();
       if (this.sessions.get(peerId) !== s) return;
-      await this.send({ to: peerId, kind: "offer", sid: s.sid, sdp, local });
-      this.log(`[${this.tag(peerId)}] offer 전송 (${local ? "같은 네트워크 방식" : "공인 주소 방식"}) → answer 대기`);
+      await this.send({ to: peerId, kind: "offer", sid: s.sid, sdp, local: mode === "local" });
+      this.log(`[${this.tag(peerId)}] offer 전송 (${MODE_TEXT[mode]}) → answer 대기`);
       this.update(peerId, "waiting");
     } catch (e) {
       this.update(peerId, "failed", { reason: errorMessage(e) });
@@ -207,13 +214,14 @@ export class PeerManager {
         this.log("동시 연결 시도: 내 offer를 유지");
         return;
       }
-      const local = sig.local === true;
+      // 받는 쪽은 판단하지 않고 거는 쪽이 정한 방식을 따른다
+      const mode: ConnectionMode = sig.local ? "local" : "punch";
       this.endSession(from);
-      const s = this.newSession(from, "callee", local, sid);
-      this.log(`[${this.tag(from)}] offer 수신 → answer 생성`);
+      const s = this.newSession(from, "callee", mode, sid);
+      this.log(`[${this.tag(from)}] offer 수신 (${MODE_TEXT[mode]}) → answer 생성`);
       this.update(from, "gathering");
       try {
-        const answer = await s.punch.createAnswer(sdp, local);
+        const answer = await s.conn.createAnswer(sdp);
         if (this.sessions.get(from) !== s) return;
         await this.send({ to: from, kind: "answer", sid, sdp: answer });
         this.log(`[${this.tag(from)}] answer 전송`);
@@ -227,30 +235,31 @@ export class PeerManager {
       if (!s || s.view.role !== "caller" || s.sid !== sid || s.answered) return;
       s.answered = true;
       this.log(`[${this.tag(from)}] answer 수신 → 적용`);
-      await s.punch.acceptAnswer(sdp);
+      await s.conn.acceptAnswer(sdp);
       this.update(from, "punching");
     }
   }
 
-  private newSession(peerId: string, role: "caller" | "callee", local: boolean, sid = newId()): Session {
+  private newSession(peerId: string, role: "caller" | "callee", mode: ConnectionMode, sid = newId()): Session {
     const tag = this.tag(peerId);
+    const opts: ConnectionOptions = {
+      isCaller: role === "caller",
+      iceServers: this.config.iceServers,
+      log: (msg) => this.log(`[${tag}] ${msg}`),
+      onEvent: (e) => {
+        if (this.sessions.get(peerId) === s) this.onConnectionEvent(peerId, e);
+      },
+    };
     const s: Session = {
       sid,
       answered: false,
-      view: { role, local, state: "gathering" },
+      view: { role, mode, state: "gathering" },
       timer: setTimeout(() => {
         if (this.sessions.get(peerId) === s && s.view.state !== "connected") {
           this.update(peerId, "failed", { reason: "시간 초과" });
         }
       }, CONNECT_TIMEOUT_MS),
-      punch: new Punch({
-        isCaller: role === "caller",
-        iceServers: this.config.iceServers,
-        log: (msg) => this.log(`[${tag}] ${msg}`),
-        onEvent: (e) => {
-          if (this.sessions.get(peerId) === s) this.onPunchEvent(peerId, e);
-        },
-      }),
+      conn: mode === "local" ? new LocalConnection(opts) : new PunchConnection(opts),
     };
     this.sessions.set(peerId, s);
     return s;
@@ -261,10 +270,10 @@ export class PeerManager {
     if (!s) return;
     clearTimeout(s.timer);
     this.sessions.delete(peerId); // 먼저 지워서 close 이후 이벤트를 무시한다
-    s.punch.close();
+    s.conn.close();
   }
 
-  private onPunchEvent(peerId: string, e: PunchEvent): void {
+  private onConnectionEvent(peerId: string, e: ConnectionEvent): void {
     const s = this.sessions.get(peerId);
     if (!s) return;
     const v = s.view;
@@ -358,6 +367,8 @@ export class PeerManager {
     };
   }
 }
+
+const MODE_TEXT: Record<ConnectionMode, string> = { local: "같은 네트워크 방식", punch: "공인 주소 방식" };
 
 // ===== 상대가 보낸 값 검사 (로비는 누구나 쓸 수 있으므로 형태를 확인한다) =====
 
