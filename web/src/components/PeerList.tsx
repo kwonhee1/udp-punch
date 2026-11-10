@@ -1,3 +1,4 @@
+import { formatBytes } from "../lib/format";
 import type { PeerInfo, PeerManager, SessionState, SessionView, Snapshot } from "../lib/peer-manager";
 
 const STATE_TEXT: Record<SessionState, [string, "ok" | "warn" | "err" | "muted"]> = {
@@ -28,6 +29,7 @@ export function PeerList({ manager, snapshot }: { manager: PeerManager; snapshot
               sameNetwork={manager.isSameNetwork(p)}
               onConnect={() => manager.connect(p.id)}
               onPing={() => manager.ping(p.id)}
+              onSendFile={(file) => manager.sendFile(p.id, file)}
             />
           ))}
         </ul>
@@ -42,9 +44,10 @@ interface PeerItemProps {
   sameNetwork: boolean;
   onConnect: () => void;
   onPing: () => void;
+  onSendFile: (file: File) => void;
 }
 
-function PeerItem({ peer, session, sameNetwork, onConnect, onPing }: PeerItemProps) {
+function PeerItem({ peer, session, sameNetwork, onConnect, onPing, onSendFile }: PeerItemProps) {
   return (
     <li className="peer">
       <div className="info">
@@ -54,8 +57,9 @@ function PeerItem({ peer, session, sameNetwork, onConnect, onPing }: PeerItemPro
         </div>
         <div className="label">{[peer.device, peer.ip].filter(Boolean).join(" · ")}</div>
         {session && <StatusLine session={session} sameNetwork={sameNetwork} />}
+        {session?.state === "connected" && <FileLine session={session} />}
       </div>
-      <PeerButton session={session} onConnect={onConnect} onPing={onPing} />
+      <PeerButton session={session} onConnect={onConnect} onPing={onPing} onSendFile={onSendFile} />
     </li>
   );
 }
@@ -74,12 +78,37 @@ function StatusLine({ session, sameNetwork }: { session: SessionView; sameNetwor
   return <div className={`status ${cls}`}>{line}</div>;
 }
 
-function PeerButton({ session, onConnect, onPing }: Omit<PeerItemProps, "peer" | "sameNetwork">) {
+function FileLine({ session }: { session: SessionView }) {
+  const max = session.maxFileSize != null ? `파일 최대 ${formatBytes(session.maxFileSize)}` : "파일 최대 크기 알 수 없음";
+  const note = session.fileNote;
+  return (
+    <div className="status muted">
+      {max}
+      {note && <span className={note.ok ? "ok" : "err"}> · {note.text}</span>}
+    </div>
+  );
+}
+
+function PeerButton({ session, onConnect, onPing, onSendFile }: Omit<PeerItemProps, "peer" | "sameNetwork">) {
   if (session?.state === "connected") {
     return (
-      <button className="ghost" onClick={onPing}>
-        핑
-      </button>
+      <div className="actions">
+        <button className="ghost" onClick={onPing}>
+          핑
+        </button>
+        <label className="button">
+          파일 보내기
+          <input
+            type="file"
+            hidden
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = ""; // 같은 파일을 다시 골라도 onChange가 오게
+              if (file) onSendFile(file);
+            }}
+          />
+        </label>
+      </div>
     );
   }
   if (session && !RETRYABLE.includes(session.state)) {

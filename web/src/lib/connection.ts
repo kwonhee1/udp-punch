@@ -9,7 +9,9 @@ export type ConnectionEvent =
   | { type: "failed"; reason: string }
   | { type: "connected"; pair: string | null }
   | { type: "closed" }
-  | { type: "rtt"; rtt: number };
+  | { type: "rtt"; rtt: number }
+  /** 상대가 보낸 파일을 다 받음. data는 파일 내용 */
+  | { type: "file"; name: string; mime: string; data: Blob };
 
 export interface ConnectionOptions {
   isCaller: boolean;
@@ -27,5 +29,9 @@ export interface Connection {
   acceptAnswer(answerSdp: string): Promise<void>;
   /** 연결된 뒤 왕복 시간 측정 */
   ping(): void;
+  /** 파일 하나를 메시지 하나로 보낸다. 최대 크기보다 크거나 연결 전이면 예외 */
+  sendFile(file: File): Promise<void>;
+  /** 한 번에 보낼 수 있는 최대 파일 크기 (바이트). 연결 전이면 null */
+  maxFileSize(): number | null;
   close(): void;
 }

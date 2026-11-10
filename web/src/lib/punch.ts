@@ -29,6 +29,14 @@ export class PunchConnection implements Connection {
     this.link.ping();
   }
 
+  sendFile(file: File): Promise<void> {
+    return this.link.sendFile(file);
+  }
+
+  maxFileSize(): number | null {
+    return this.link.maxFileSize();
+  }
+
   close(): void {
     this.link.close();
   }

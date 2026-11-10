@@ -9,6 +9,7 @@ import type { Connection, ConnectionEvent, ConnectionOptions } from "./connectio
 import { deviceLabel, newId, randomName } from "./identity";
 import { LocalConnection } from "./local";
 import { PunchConnection } from "./punch";
+import { formatBytes } from "./format";
 import { DEFAULT_ICE_SERVERS, probePublicIp } from "./rtc";
 
 const LOBBY_TOPIC = "lobby";
@@ -34,6 +35,21 @@ export interface SessionView {
   pair?: string | null;
   rtt?: number;
   reason?: string;
+  /** 연결된 뒤: 한 번에 보낼 수 있는 최대 파일 크기 (바이트) */
+  maxFileSize?: number | null;
+  /** 마지막 파일 보내기 결과 */
+  fileNote?: { ok: boolean; text: string };
+}
+
+export interface ReceivedFile {
+  id: string;
+  from: string;
+  fromName: string;
+  name: string;
+  mime: string;
+  size: number;
+  /** 다운로드용 blob: 주소 */
+  url: string;
 }
 
 export interface Snapshot {
@@ -42,6 +58,7 @@ export interface Snapshot {
   ipProbed: boolean;
   peers: readonly PeerInfo[];
   sessions: Readonly<Record<string, SessionView>>;
+  files: readonly ReceivedFile[];
   logs: readonly string[];
 }
 
@@ -75,6 +92,7 @@ export class PeerManager {
   private readonly peers = new Map<string, PeerInfo>();
   private readonly sessions = new Map<string, Session>();
   private readonly listeners = new Set<() => void>();
+  private files: ReceivedFile[] = [];
   private logs: string[] = [];
   private lobby = "접속 중…";
   private ipProbed = false;
@@ -162,6 +180,8 @@ export class PeerManager {
     this.gen++;
     for (const id of [...this.sessions.keys()]) this.endSession(id);
     this.peers.clear();
+    for (const f of this.files) URL.revokeObjectURL(f.url);
+    this.files = [];
     this.subscribed = false;
     const db = this.db;
     this.db = null;
@@ -178,6 +198,23 @@ export class PeerManager {
 
   ping(peerId: string): void {
     this.sessions.get(peerId)?.conn.ping();
+  }
+
+  /** 연결된 상대에게 파일 하나를 보낸다. 결과는 세션의 fileNote와 로그에 남는다. */
+  sendFile(peerId: string, file: File): void {
+    const s = this.sessions.get(peerId);
+    if (!s || s.view.state !== "connected") {
+      this.log(`[${this.tag(peerId)}] 파일 보내기 실패: 연결되지 않음`);
+      return;
+    }
+    this.updateIfCurrent(peerId, s, { fileNote: { ok: true, text: `보내는 중: ${file.name}` } });
+    s.conn.sendFile(file).then(
+      () => this.updateIfCurrent(peerId, s, { fileNote: { ok: true, text: `보냄: ${file.name} (${formatBytes(file.size)})` } }),
+      (e) => {
+        this.log(`[${this.tag(peerId)}] 파일 보내기 실패: ${errorMessage(e)}`);
+        this.updateIfCurrent(peerId, s, { fileNote: { ok: false, text: `보내기 실패: ${errorMessage(e)}` } });
+      },
+    );
   }
 
   isSameNetwork(peer: PeerInfo): boolean {
@@ -297,6 +334,21 @@ export class PeerManager {
       case "connected":
         v.state = "connected";
         v.pair = e.pair;
+        v.maxFileSize = s.conn.maxFileSize();
+        break;
+      case "file":
+        this.files = [
+          ...this.files,
+          {
+            id: newId(),
+            from: peerId,
+            fromName: this.tag(peerId),
+            name: e.name,
+            mime: e.mime,
+            size: e.data.size,
+            url: URL.createObjectURL(e.data),
+          },
+        ];
         break;
       case "failed":
         this.setFailed(v, e.reason);
@@ -310,6 +362,13 @@ export class PeerManager {
     if (!s) return;
     Object.assign(s.view, extra, { state });
     this.afterUpdate(s);
+  }
+
+  /** 세션이 그사이 바뀌지 않았을 때만 갱신한다 (다시 시도로 새 세션이 생긴 경우 무시) */
+  private updateIfCurrent(peerId: string, s: Session, extra: Partial<SessionView>): void {
+    if (this.sessions.get(peerId) !== s) return;
+    Object.assign(s.view, extra);
+    this.emit();
   }
 
   private setFailed(v: SessionView, reason: string): void {
@@ -363,6 +422,7 @@ export class PeerManager {
       ipProbed: this.ipProbed,
       peers: [...this.peers.values()],
       sessions,
+      files: this.files,
       logs: this.logs,
     };
   }
